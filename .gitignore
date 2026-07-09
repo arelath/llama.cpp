@@ -43,7 +43,9 @@
 
 /tags
 /.build/
+/.deps/
 /build*
+!/build-local.bat
 /release
 /debug
 /libllama.so
@@ -153,3 +155,13 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# NanoQuants testing - Please Remove 
+bench-nanoquant-*
+build-local.bat
+convert_nanoquant*
+nsys-nanoquant-*
+docs/development/nanoquant-tasks.md
+scripts/benchmark-nanoquant-throughput.py
+scripts/test-nanoquant-inference.py
+docs/development/nanoquant.md

@@ -2408,6 +2408,7 @@ llm_graph_params llama_context::graph_params(
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
+        /*.model       =*/ &model,
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,

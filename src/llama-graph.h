@@ -18,6 +18,7 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
+struct llama_model;
 
 struct llama_memory_context_i;
 
@@ -667,6 +668,7 @@ struct llm_graph_params {
     llama_cparams cparams;
 
     llama_ubatch ubatch; // note: intentionally make a copy
+    const llama_model * model = nullptr;
 
     llm_graph_type gtype;
 
@@ -704,6 +706,10 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (model != other.model) {
+            return false;
+        }
+
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -867,6 +873,7 @@ struct llm_graph_context {
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
+    const llama_model   * model;
 
     const int64_t n_embd;
     const int64_t n_layer;

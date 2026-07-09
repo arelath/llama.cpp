@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/nanoquant.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -2121,6 +2122,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_NANOQUANT_LINEAR:
+            ggml_cuda_op_nanoquant_linear(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -4682,6 +4686,71 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     default:
                         return false;
                 }
+            } break;
+        case GGML_OP_NANOQUANT_LINEAR:
+            {
+                const ggml_tensor * x          = op->src[0];
+                const ggml_tensor * v_bits     = op->src[1];
+                const ggml_tensor * u_bits     = op->src[2];
+                const ggml_tensor * scale_pre  = op->src[3];
+                const ggml_tensor * scale_mid  = op->src[4];
+                const ggml_tensor * scale_post = op->src[5];
+                const ggml_tensor * salient_idx    = op->src[6];
+                const ggml_tensor * salient_weight = op->src[7];
+                const ggml_tensor * salient_scale  = op->src[8];
+
+                auto is_fp_type = [](ggml_type type) {
+                    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+                };
+
+                if (op->type != GGML_TYPE_F32 ||
+                    !is_fp_type(x->type) ||
+                    v_bits->type != GGML_TYPE_I32 ||
+                    u_bits->type != GGML_TYPE_I32 ||
+                    !is_fp_type(scale_pre->type) ||
+                    !is_fp_type(scale_mid->type) ||
+                    !is_fp_type(scale_post->type)) {
+                    return false;
+                }
+
+                // The CUDA kernels accept arbitrary outer strides but require
+                // contiguous innermost dimensions for packed-bit and scale loads.
+                if (x->nb[0] != ggml_element_size(x) ||
+                    op->nb[0] != ggml_element_size(op) ||
+                    v_bits->nb[0] != ggml_element_size(v_bits) ||
+                    u_bits->nb[0] != ggml_element_size(u_bits) ||
+                    scale_pre->nb[0] != ggml_element_size(scale_pre) ||
+                    scale_mid->nb[0] != ggml_element_size(scale_mid) ||
+                    scale_post->nb[0] != ggml_element_size(scale_post)) {
+                    return false;
+                }
+
+                if ((salient_idx == nullptr) != (salient_weight == nullptr)) {
+                    return false;
+                }
+                if (salient_scale != nullptr && salient_weight == nullptr) {
+                    return false;
+                }
+                if (salient_idx != nullptr) {
+                    if (salient_idx->type != GGML_TYPE_I32 ||
+                        salient_idx->nb[0] != ggml_element_size(salient_idx) ||
+                        salient_weight->nb[0] != ggml_element_size(salient_weight)) {
+                        return false;
+                    }
+                    if (salient_weight->type == GGML_TYPE_I8) {
+                        if (salient_scale == nullptr ||
+                            !is_fp_type(salient_scale->type) ||
+                            salient_scale->nb[0] != ggml_element_size(salient_scale)) {
+                            return false;
+                        }
+                    } else if (!is_fp_type(salient_weight->type)) {
+                        return false;
+                    } else if (salient_scale != nullptr) {
+                        return false;
+                    }
+                }
+
+                return true;
             } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;

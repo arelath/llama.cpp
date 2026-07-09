@@ -221,6 +221,21 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_norm      = nullptr;
 };
 
+struct llama_nanoquant_weight {
+    struct ggml_tensor * v          = nullptr;
+    struct ggml_tensor * u          = nullptr;
+    struct ggml_tensor * scale_pre  = nullptr;
+    struct ggml_tensor * scale_mid  = nullptr;
+    struct ggml_tensor * scale_post = nullptr;
+    struct ggml_tensor * salient_idx    = nullptr;
+    struct ggml_tensor * salient_weight = nullptr;
+    struct ggml_tensor * salient_scale  = nullptr;
+
+    bool enabled() const {
+        return v != nullptr;
+    }
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -617,6 +632,8 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    std::unordered_map<std::string, llama_nanoquant_weight> nanoquant_weights;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
@@ -662,6 +679,7 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    const llama_nanoquant_weight * get_nanoquant_weight(const struct ggml_tensor * weight) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
@@ -705,6 +723,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_NOT_REQUIRED;
     const int TENSOR_SKIP;
     const int TENSOR_SKIP_IF_VIRTUAL;
+    const int TENSOR_VIRTUAL;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
@@ -713,6 +732,9 @@ struct llama_model_base : public llama_model {
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    ggml_tensor * create_tensor_as_nanoquant(const LLM_TN_IMPL & weight_tn,
+                const std::initializer_list<int64_t> & ne, int flags);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

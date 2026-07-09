@@ -512,6 +512,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_NANOQUANT_LINEAR,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1421,6 +1422,28 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // x: F32/F16/BF16 activations, [in, ...]
+    // v_bits: I32 packed binary matrix V, [ceil(in/32), rank]
+    // u_bits: I32 packed binary matrix U, [ceil(rank/32), out]
+    // scale_pre: F32/F16/BF16 scale, [in]
+    // scale_mid: F32/F16/BF16 scale, [rank]
+    // scale_post: F32/F16/BF16 scale, [out]
+    // salient_idx: optional I32 salient input columns, [k]
+    // salient_weight: optional F32/F16/BF16 or I8 weight, [k, out]
+    // salient_scale: optional F32/F16/BF16 scale for I8 salient_weight, [k]
+    // result: F32, [out, ...]
+    GGML_API struct ggml_tensor * ggml_nanoquant_linear(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * v_bits,
+            struct ggml_tensor  * u_bits,
+            struct ggml_tensor  * scale_pre,
+            struct ggml_tensor  * scale_mid,
+            struct ggml_tensor  * scale_post,
+            struct ggml_tensor  * salient_idx,
+            struct ggml_tensor  * salient_weight,
+            struct ggml_tensor  * salient_scale);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

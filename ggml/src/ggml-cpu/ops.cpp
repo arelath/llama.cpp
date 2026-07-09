@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -11462,6 +11463,159 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
             }
+    }
+}
+
+static inline float ggml_nanoquant_get_f32_1d(const ggml_tensor * src, int64_t i0) {
+    const char * data = (const char *) src->data + i0*src->nb[0];
+
+    switch (src->type) {
+        case GGML_TYPE_F32:
+            return *(const float *) data;
+        case GGML_TYPE_F16:
+            return GGML_FP16_TO_FP32(*(const ggml_fp16_t *) data);
+        case GGML_TYPE_BF16:
+            return GGML_BF16_TO_FP32(*(const ggml_bf16_t *) data);
+        default:
+            GGML_ABORT("unsupported NanoQuant scalar type: %s", ggml_type_name(src->type));
+    }
+}
+
+static inline float ggml_nanoquant_get_f32_4d(const ggml_tensor * src, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    const char * data = (const char *) src->data + i0*src->nb[0] + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3];
+
+    switch (src->type) {
+        case GGML_TYPE_F32:
+            return *(const float *) data;
+        case GGML_TYPE_F16:
+            return GGML_FP16_TO_FP32(*(const ggml_fp16_t *) data);
+        case GGML_TYPE_BF16:
+            return GGML_BF16_TO_FP32(*(const ggml_bf16_t *) data);
+        default:
+            GGML_ABORT("unsupported NanoQuant activation type: %s", ggml_type_name(src->type));
+    }
+}
+
+static inline int32_t ggml_nanoquant_get_i32_1d(const ggml_tensor * src, int64_t i0) {
+    const char * data = (const char *) src->data + i0*src->nb[0];
+
+    GGML_ASSERT(src->type == GGML_TYPE_I32);
+    return *(const int32_t *) data;
+}
+
+static inline float ggml_nanoquant_get_f32_2d(const ggml_tensor * src, int64_t i0, int64_t i1) {
+    const char * data = (const char *) src->data + i0*src->nb[0] + i1*src->nb[1];
+
+    switch (src->type) {
+        case GGML_TYPE_F32:
+            return *(const float *) data;
+        case GGML_TYPE_F16:
+            return GGML_FP16_TO_FP32(*(const ggml_fp16_t *) data);
+        case GGML_TYPE_BF16:
+            return GGML_BF16_TO_FP32(*(const ggml_bf16_t *) data);
+        case GGML_TYPE_I8:
+            return (float) *(const int8_t *) data;
+        default:
+            GGML_ABORT("unsupported NanoQuant salient weight type: %s", ggml_type_name(src->type));
+    }
+}
+
+static inline float ggml_nanoquant_get_sign(const ggml_tensor * bits, int64_t row, int64_t col) {
+    const int64_t word_idx = col/32;
+    const int64_t bit_idx  = col%32;
+    const uint32_t word = *(const uint32_t *) ((const char *) bits->data + word_idx*bits->nb[0] + row*bits->nb[1]);
+
+    return (word & (uint32_t(1) << bit_idx)) ? -1.0f : 1.0f;
+}
+
+void ggml_compute_forward_nanoquant_linear(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x          = dst->src[0];
+    const ggml_tensor * v_bits     = dst->src[1];
+    const ggml_tensor * u_bits     = dst->src[2];
+    const ggml_tensor * scale_pre  = dst->src[3];
+    const ggml_tensor * scale_mid  = dst->src[4];
+    const ggml_tensor * scale_post = dst->src[5];
+    const ggml_tensor * salient_idx    = dst->src[6];
+    const ggml_tensor * salient_weight = dst->src[7];
+    const ggml_tensor * salient_scale  = dst->src[8];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(u_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n_in   = x->ne[0];
+    const int64_t n_rank = scale_mid->ne[0];
+    const int64_t n_out  = dst->ne[0];
+    const int64_t n_salient = salient_idx == nullptr ? 0 : salient_idx->ne[0];
+
+    const int64_t o0 = (n_out*ith)/nth;
+    const int64_t o1 = (n_out*(ith + 1))/nth;
+    if (o0 >= o1) {
+        return;
+    }
+
+    // This CPU implementation is a correctness reference.  It preloads scales
+    // per worker and keeps tmp local because the rank buffer is reused for each
+    // activation column.
+    std::vector<float> pre(n_in);
+    std::vector<float> mid(n_rank);
+    std::vector<float> post(n_out);
+    std::vector<float> tmp(n_rank);
+
+    for (int64_t i = 0; i < n_in; ++i) {
+        pre[i] = ggml_nanoquant_get_f32_1d(scale_pre, i);
+    }
+    for (int64_t r = 0; r < n_rank; ++r) {
+        mid[r] = ggml_nanoquant_get_f32_1d(scale_mid, r);
+    }
+    for (int64_t o = o0; o < o1; ++o) {
+        post[o] = ggml_nanoquant_get_f32_1d(scale_post, o);
+    }
+
+    const int64_t n_col = dst->ne[1]*dst->ne[2]*dst->ne[3];
+
+    for (int64_t c = 0; c < n_col; ++c) {
+        const int64_t i3 = c/(dst->ne[1]*dst->ne[2]);
+        const int64_t r2 = c - i3*dst->ne[1]*dst->ne[2];
+        const int64_t i2 = r2/dst->ne[1];
+        const int64_t i1 = r2 - i2*dst->ne[1];
+
+        for (int64_t r = 0; r < n_rank; ++r) {
+            float acc = 0.0f;
+            for (int64_t i = 0; i < n_in; ++i) {
+                const float xv = ggml_nanoquant_get_f32_4d(x, i, i1, i2, i3) * pre[i];
+                acc += xv * ggml_nanoquant_get_sign(v_bits, r, i);
+            }
+            tmp[r] = acc * mid[r];
+        }
+
+        for (int64_t o = o0; o < o1; ++o) {
+            float acc = 0.0f;
+            for (int64_t r = 0; r < n_rank; ++r) {
+                acc += tmp[r] * ggml_nanoquant_get_sign(u_bits, o, r);
+            }
+
+            float value = acc * post[o];
+            for (int64_t s = 0; s < n_salient; ++s) {
+                const int64_t idx = ggml_nanoquant_get_i32_1d(salient_idx, s);
+                GGML_ASSERT(idx >= 0 && idx < n_in);
+
+                // Salient outliers are added as a sparse dense side path after
+                // the low-rank binary product.
+                float weight = ggml_nanoquant_get_f32_2d(salient_weight, s, o);
+                if (salient_scale != nullptr) {
+                    weight *= ggml_nanoquant_get_f32_1d(salient_scale, s);
+                }
+                value += ggml_nanoquant_get_f32_4d(x, idx, i1, i2, i3)*weight;
+            }
+
+            float * out = (float *) ((char *) dst->data + o*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+            *out = value;
+        }
     }
 }
 

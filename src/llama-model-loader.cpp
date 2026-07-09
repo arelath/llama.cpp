@@ -1051,6 +1051,18 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+static bool is_nanoquant_sidecar(const char * suffix) {
+    return suffix != nullptr && (
+        strcmp(suffix, "nq_v") == 0 ||
+        strcmp(suffix, "nq_u") == 0 ||
+        strcmp(suffix, "nq_scale_pre") == 0 ||
+        strcmp(suffix, "nq_scale_mid") == 0 ||
+        strcmp(suffix, "nq_scale_post") == 0 ||
+        strcmp(suffix, "nq_salient_idx") == 0 ||
+        strcmp(suffix, "nq_salient_weight") == 0 ||
+        strcmp(suffix, "nq_salient_scale") == 0);
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1061,6 +1073,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+            max_n_tensors += hparams.n_layer()*16; // virtual tensor placeholders
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
@@ -1083,6 +1096,16 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         return it->second.get();
     };
+
+    if (flags & TENSOR_VIRTUAL) {
+        GGML_ASSERT(buft_list_cpu != nullptr);
+        GGML_ASSERT(!buft_list_cpu->empty());
+
+        ggml_context * ctx = ctx_for_buft(buft_list_cpu->front().second);
+        ggml_tensor * ret = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, 1);
+        ggml_set_name(ret, tn.str().c_str());
+        return ret;
+    }
 
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
@@ -1190,7 +1213,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            if (is_nanoquant_sidecar(tn.suffix)) {
+                // Sidecars are consumed by GGML_OP_NANOQUANT_LINEAR as a group.  Keep
+                // them with the preferred layer buffer instead of probing each I32 or
+                // scale tensor as if it were a standalone MUL_MAT weight.
+                buft = buft_list->front().second;
+            } else {
+                buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            }
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }

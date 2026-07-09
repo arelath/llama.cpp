@@ -1021,6 +1021,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "NANOQUANT_LINEAR",
     "OUT_PROD",
 
     "SCALE",
@@ -1096,7 +1097,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1132,6 +1133,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "nq_linear(x)",
     "X*Y",
 
     "x*v",
@@ -1207,7 +1209,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3268,6 +3270,75 @@ struct ggml_tensor * ggml_mul_mat(
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_nanoquant_linear(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * v_bits,
+        struct ggml_tensor  * u_bits,
+        struct ggml_tensor  * scale_pre,
+        struct ggml_tensor  * scale_mid,
+        struct ggml_tensor  * scale_post,
+        struct ggml_tensor  * salient_idx,
+        struct ggml_tensor  * salient_weight,
+        struct ggml_tensor  * salient_scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_BF16);
+    GGML_ASSERT(v_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(u_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(scale_pre->type == GGML_TYPE_F32 || scale_pre->type == GGML_TYPE_F16 || scale_pre->type == GGML_TYPE_BF16);
+    GGML_ASSERT(scale_mid->type == GGML_TYPE_F32 || scale_mid->type == GGML_TYPE_F16 || scale_mid->type == GGML_TYPE_BF16);
+    GGML_ASSERT(scale_post->type == GGML_TYPE_F32 || scale_post->type == GGML_TYPE_F16 || scale_post->type == GGML_TYPE_BF16);
+
+    const int64_t n_in   = x->ne[0];
+    const int64_t n_rank = scale_mid->ne[0];
+    const int64_t n_out  = scale_post->ne[0];
+
+    GGML_ASSERT(scale_pre->ne[0] == n_in);
+    GGML_ASSERT(v_bits->ne[0] == (n_in + 31)/32);
+    GGML_ASSERT(v_bits->ne[1] == n_rank);
+    GGML_ASSERT(u_bits->ne[0] == (n_rank + 31)/32);
+    GGML_ASSERT(u_bits->ne[1] == n_out);
+    // NULL salient sources are the no-outlier variant of the same op.  A
+    // separate scale sidecar means salient_weight stores I8 values.
+    GGML_ASSERT((salient_idx == NULL) == (salient_weight == NULL));
+    GGML_ASSERT(salient_scale == NULL || salient_weight != NULL);
+
+    if (salient_idx != NULL) {
+        const int64_t n_salient = salient_idx->ne[0];
+        GGML_ASSERT(salient_idx->type == GGML_TYPE_I32);
+        GGML_ASSERT(salient_weight->ne[0] == n_salient);
+        GGML_ASSERT(salient_weight->ne[1] == n_out);
+        if (salient_scale != NULL) {
+            GGML_ASSERT(salient_weight->type == GGML_TYPE_I8);
+            GGML_ASSERT(salient_scale->type == GGML_TYPE_F32 ||
+                        salient_scale->type == GGML_TYPE_F16 ||
+                        salient_scale->type == GGML_TYPE_BF16);
+            GGML_ASSERT(salient_scale->ne[0] == n_salient);
+        } else {
+            GGML_ASSERT(salient_weight->type == GGML_TYPE_F32 ||
+                        salient_weight->type == GGML_TYPE_F16 ||
+                        salient_weight->type == GGML_TYPE_BF16);
+        }
+    }
+
+    const int64_t ne[4] = { n_out, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_NANOQUANT_LINEAR;
+    result->src[0] = x;
+    result->src[1] = v_bits;
+    result->src[2] = u_bits;
+    result->src[3] = scale_pre;
+    result->src[4] = scale_mid;
+    result->src[5] = scale_post;
+    // Optional side path sources are left NULL so backends can specialize the
+    // common no-outlier case without adding another public op.
+    result->src[6] = salient_idx;
+    result->src[7] = salient_weight;
+    result->src[8] = salient_scale;
 
     return result;
 }
@@ -6627,6 +6698,9 @@ static void ggml_compute_backward(
                             ggml_transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
             }
+        } break;
+        case GGML_OP_NANOQUANT_LINEAR: {
+            GGML_ASSERT(!src0_needs_grads && !src1_needs_grads && !src2_needs_grads);
         } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
