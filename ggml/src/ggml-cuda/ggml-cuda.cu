@@ -2126,6 +2126,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_NANOQUANT_LINEAR:
             ggml_cuda_op_nanoquant_linear(ctx, dst);
             break;
+        case GGML_OP_NANOQUANT_STAGE1_FUSED:
+            ggml_cuda_op_nanoquant_stage1_fused(ctx, dst);
+            break;
+        case GGML_OP_NANOQUANT_STAGE2:
+            ggml_cuda_op_nanoquant_stage2(ctx, dst);
+            break;
+        case GGML_OP_NANOQUANT_STAGE2_FUSED2:
+            ggml_cuda_op_nanoquant_stage2_fused2(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -4748,6 +4757,147 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     } else if (salient_scale != nullptr) {
                         return false;
                     }
+                }
+
+                return true;
+            } break;
+        case GGML_OP_NANOQUANT_STAGE1_FUSED:
+            {
+                auto is_fp_type = [](ggml_type type) {
+                    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+                };
+
+                if (op->type != GGML_TYPE_F32 || !is_fp_type(op->src[0]->type) ||
+                    op->nb[0] != ggml_element_size(op) ||
+                    op->src[0]->nb[0] != ggml_element_size(op->src[0])) {
+                    return false;
+                }
+
+                for (int i = 0; i < 3; ++i) {
+                    const ggml_tensor * v   = op->src[1 + 3*i];
+                    const ggml_tensor * pre = op->src[2 + 3*i];
+                    const ggml_tensor * mid = op->src[3 + 3*i];
+                    if (v == nullptr) {
+                        continue;
+                    }
+                    if (v->type != GGML_TYPE_I32 || !is_fp_type(pre->type) || !is_fp_type(mid->type) ||
+                        v->nb[0] != ggml_element_size(v) ||
+                        pre->nb[0] != ggml_element_size(pre) ||
+                        mid->nb[0] != ggml_element_size(mid)) {
+                        return false;
+                    }
+                }
+
+                return true;
+            } break;
+        case GGML_OP_NANOQUANT_STAGE2:
+            {
+                const ggml_tensor * x          = op->src[0];
+                const ggml_tensor * tmp        = op->src[1];
+                const ggml_tensor * u_bits     = op->src[2];
+                const ggml_tensor * scale_post = op->src[3];
+                const ggml_tensor * salient_idx    = op->src[4];
+                const ggml_tensor * salient_weight = op->src[5];
+                const ggml_tensor * salient_scale  = op->src[6];
+
+                auto is_fp_type = [](ggml_type type) {
+                    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+                };
+
+                if (op->type != GGML_TYPE_F32 ||
+                    !is_fp_type(x->type) ||
+                    tmp->type != GGML_TYPE_F32 ||
+                    u_bits->type != GGML_TYPE_I32 ||
+                    !is_fp_type(scale_post->type) ||
+                    x->nb[0] != ggml_element_size(x) ||
+                    tmp->nb[0] != ggml_element_size(tmp) ||
+                    op->nb[0] != ggml_element_size(op) ||
+                    u_bits->nb[0] != ggml_element_size(u_bits) ||
+                    scale_post->nb[0] != ggml_element_size(scale_post)) {
+                    return false;
+                }
+
+                if ((salient_idx == nullptr) != (salient_weight == nullptr)) {
+                    return false;
+                }
+                if (salient_scale != nullptr && salient_weight == nullptr) {
+                    return false;
+                }
+                if (salient_idx != nullptr) {
+                    if (salient_idx->type != GGML_TYPE_I32 ||
+                        salient_idx->nb[0] != ggml_element_size(salient_idx) ||
+                        salient_weight->nb[0] != ggml_element_size(salient_weight)) {
+                        return false;
+                    }
+                    if (salient_weight->type == GGML_TYPE_I8) {
+                        if (salient_scale == nullptr ||
+                            !is_fp_type(salient_scale->type) ||
+                            salient_scale->nb[0] != ggml_element_size(salient_scale)) {
+                            return false;
+                        }
+                    } else if (!is_fp_type(salient_weight->type)) {
+                        return false;
+                    } else if (salient_scale != nullptr) {
+                        return false;
+                    }
+                }
+
+                return true;
+            } break;
+        case GGML_OP_NANOQUANT_STAGE2_FUSED2:
+            {
+                const ggml_tensor * x       = op->src[0];
+                const ggml_tensor * tmp     = op->src[1];
+                const ggml_tensor * u0      = op->src[2];
+                const ggml_tensor * post0   = op->src[3];
+                const ggml_tensor * idx0    = op->src[4];
+                const ggml_tensor * weight0 = op->src[5];
+                const ggml_tensor * u1      = op->src[6];
+                const ggml_tensor * post1   = op->src[7];
+                const ggml_tensor * idx1    = op->src[8];
+                const ggml_tensor * weight1 = op->src[9];
+
+                auto is_fp_type = [](ggml_type type) {
+                    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+                };
+
+                if (op->type != GGML_TYPE_F32 ||
+                    !is_fp_type(x->type) ||
+                    tmp->type != GGML_TYPE_F32 ||
+                    u0->type != GGML_TYPE_I32 ||
+                    u1->type != GGML_TYPE_I32 ||
+                    !is_fp_type(post0->type) ||
+                    !is_fp_type(post1->type) ||
+                    x->nb[0] != ggml_element_size(x) ||
+                    tmp->nb[0] != ggml_element_size(tmp) ||
+                    op->nb[0] != ggml_element_size(op) ||
+                    u0->nb[0] != ggml_element_size(u0) ||
+                    u1->nb[0] != ggml_element_size(u1) ||
+                    post0->nb[0] != ggml_element_size(post0) ||
+                    post1->nb[0] != ggml_element_size(post1)) {
+                    return false;
+                }
+
+                const int64_t n_rank0 = ggml_get_op_params_i32(op, 0);
+                const int64_t n_rank1 = ggml_get_op_params_i32(op, 1);
+                if (n_rank0%WARP_SIZE != 0 || n_rank1%WARP_SIZE != 0) {
+                    return false;
+                }
+
+                if (idx0 == nullptr || idx1 == nullptr || weight0 == nullptr || weight1 == nullptr) {
+                    return false;
+                }
+                if (idx0->type != GGML_TYPE_I32 || idx1->type != GGML_TYPE_I32 ||
+                        idx0->ne[0] != 2 || idx1->ne[0] != 2 ||
+                        idx0->nb[0] != ggml_element_size(idx0) ||
+                        idx1->nb[0] != ggml_element_size(idx1) ||
+                        weight0->type != GGML_TYPE_F16 ||
+                        weight1->type != GGML_TYPE_F16 ||
+                        weight0->nb[0] != ggml_element_size(weight0) ||
+                        weight1->nb[0] != ggml_element_size(weight1) ||
+                        weight0->nb[1] != 2*ggml_element_size(weight0) ||
+                        weight1->nb[1] != 2*ggml_element_size(weight1)) {
+                    return false;
                 }
 
                 return true;

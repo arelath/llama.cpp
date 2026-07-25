@@ -19,6 +19,7 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 struct llama_model;
+struct llama_nanoquant_weight;
 
 struct llama_memory_context_i;
 
@@ -938,9 +939,20 @@ struct llm_graph_context {
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
-              ggml_tensor * w,
-              ggml_tensor * cur,
-              ggml_tensor * w_s = nullptr) const;
+            ggml_tensor * w,
+            ggml_tensor * cur,
+            ggml_tensor * w_s = nullptr) const;
+
+    ggml_tensor * build_nanoquant_stage2(
+            const llama_nanoquant_weight * nq,
+            ggml_tensor * cur,
+            ggml_tensor * tmp,
+            ggml_tensor * w_s = nullptr) const;
+
+    ggml_tensor * build_nanoquant_tmp_view(
+            ggml_tensor * tmp,
+            int64_t rank,
+            int64_t rank_offset) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(

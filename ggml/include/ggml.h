@@ -513,6 +513,9 @@ extern "C" {
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
         GGML_OP_NANOQUANT_LINEAR,
+        GGML_OP_NANOQUANT_STAGE1_FUSED,
+        GGML_OP_NANOQUANT_STAGE2,
+        GGML_OP_NANOQUANT_STAGE2_FUSED2,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1444,6 +1447,47 @@ extern "C" {
             struct ggml_tensor  * salient_idx,
             struct ggml_tensor  * salient_weight,
             struct ggml_tensor  * salient_scale);
+
+    // Internal building blocks used to fuse NanoQuant stage 1 across projections.
+    // stage1_fused accepts up to three groups of (v_bits, scale_pre, scale_mid)
+    // and returns a concatenated F32 rank buffer [sum(rank), ...].
+    GGML_API struct ggml_tensor * ggml_nanoquant_stage1_fused(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * v0,
+            struct ggml_tensor  * scale_pre0,
+            struct ggml_tensor  * scale_mid0,
+            struct ggml_tensor  * v1,
+            struct ggml_tensor  * scale_pre1,
+            struct ggml_tensor  * scale_mid1,
+            struct ggml_tensor  * v2,
+            struct ggml_tensor  * scale_pre2,
+            struct ggml_tensor  * scale_mid2);
+
+    GGML_API struct ggml_tensor * ggml_nanoquant_stage2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * tmp,
+            struct ggml_tensor  * u_bits,
+            struct ggml_tensor  * scale_post,
+            struct ggml_tensor  * salient_idx,
+            struct ggml_tensor  * salient_weight,
+            struct ggml_tensor  * salient_scale);
+
+    GGML_API struct ggml_tensor * ggml_nanoquant_stage2_fused2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * tmp,
+            struct ggml_tensor  * u0,
+            struct ggml_tensor  * scale_post0,
+            struct ggml_tensor  * salient_idx0,
+            struct ggml_tensor  * salient_weight0,
+            struct ggml_tensor  * u1,
+            struct ggml_tensor  * scale_post1,
+            struct ggml_tensor  * salient_idx1,
+            struct ggml_tensor  * salient_weight1,
+            int64_t               n_rank0,
+            int64_t               n_rank1);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)

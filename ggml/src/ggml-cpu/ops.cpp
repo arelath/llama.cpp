@@ -11528,6 +11528,210 @@ static inline float ggml_nanoquant_get_sign(const ggml_tensor * bits, int64_t ro
     return (word & (uint32_t(1) << bit_idx)) ? -1.0f : 1.0f;
 }
 
+void ggml_compute_forward_nanoquant_stage1_fused(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n_in = x->ne[0];
+    const int64_t n_col = dst->ne[1]*dst->ne[2]*dst->ne[3];
+
+    // CPU split-stage ops are primarily a reference/fallback path; each group
+    // writes into its concatenated rank slice of dst.
+    int64_t rank_base = 0;
+    for (int g = 0; g < 3; ++g) {
+        const ggml_tensor * v_bits    = dst->src[1 + 3*g];
+        const ggml_tensor * scale_pre = dst->src[2 + 3*g];
+        const ggml_tensor * scale_mid = dst->src[3 + 3*g];
+        if (v_bits == nullptr) {
+            continue;
+        }
+
+        GGML_ASSERT(v_bits->type == GGML_TYPE_I32);
+        const int64_t n_rank = scale_mid->ne[0];
+        const int64_t r0 = (n_rank*ith)/nth;
+        const int64_t r1 = (n_rank*(ith + 1))/nth;
+
+        for (int64_t c = 0; c < n_col; ++c) {
+            const int64_t i3 = c/(dst->ne[1]*dst->ne[2]);
+            const int64_t rem = c - i3*dst->ne[1]*dst->ne[2];
+            const int64_t i2 = rem/dst->ne[1];
+            const int64_t i1 = rem - i2*dst->ne[1];
+
+            for (int64_t r = r0; r < r1; ++r) {
+                float acc = 0.0f;
+                for (int64_t i = 0; i < n_in; ++i) {
+                    const float xv = ggml_nanoquant_get_f32_4d(x, i, i1, i2, i3) *
+                        ggml_nanoquant_get_f32_1d(scale_pre, i);
+                    acc += xv * ggml_nanoquant_get_sign(v_bits, r, i);
+                }
+                const int64_t rr = rank_base + r;
+                float * out = (float *) ((char *) dst->data + rr*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+                *out = acc * ggml_nanoquant_get_f32_1d(scale_mid, r);
+            }
+        }
+
+        rank_base += n_rank;
+    }
+}
+
+void ggml_compute_forward_nanoquant_stage2(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x          = dst->src[0];
+    const ggml_tensor * tmp        = dst->src[1];
+    const ggml_tensor * u_bits     = dst->src[2];
+    const ggml_tensor * scale_post = dst->src[3];
+    const ggml_tensor * salient_idx    = dst->src[4];
+    const ggml_tensor * salient_weight = dst->src[5];
+    const ggml_tensor * salient_scale  = dst->src[6];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(tmp->type == GGML_TYPE_F32);
+    GGML_ASSERT(u_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n_rank = tmp->ne[0];
+    const int64_t n_out  = dst->ne[0];
+    const int64_t n_salient = salient_idx == nullptr ? 0 : salient_idx->ne[0];
+
+    const int64_t o0 = (n_out*ith)/nth;
+    const int64_t o1 = (n_out*(ith + 1))/nth;
+    if (o0 >= o1) {
+        return;
+    }
+
+    std::vector<float> post(n_out);
+    for (int64_t o = o0; o < o1; ++o) {
+        post[o] = ggml_nanoquant_get_f32_1d(scale_post, o);
+    }
+
+    const int64_t n_col = dst->ne[1]*dst->ne[2]*dst->ne[3];
+    for (int64_t c = 0; c < n_col; ++c) {
+        const int64_t i3 = c/(dst->ne[1]*dst->ne[2]);
+        const int64_t rem = c - i3*dst->ne[1]*dst->ne[2];
+        const int64_t i2 = rem/dst->ne[1];
+        const int64_t i1 = rem - i2*dst->ne[1];
+
+        for (int64_t o = o0; o < o1; ++o) {
+            float acc = 0.0f;
+            for (int64_t r = 0; r < n_rank; ++r) {
+                const float tv = *(const float *) ((const char *) tmp->data + r*tmp->nb[0] + i1*tmp->nb[1] + i2*tmp->nb[2] + i3*tmp->nb[3]);
+                acc += tv * ggml_nanoquant_get_sign(u_bits, o, r);
+            }
+
+            float value = acc * post[o];
+            for (int64_t s = 0; s < n_salient; ++s) {
+                const int64_t idx = ggml_nanoquant_get_i32_1d(salient_idx, s);
+                GGML_ASSERT(idx >= 0 && idx < x->ne[0]);
+
+                float weight = ggml_nanoquant_get_f32_2d(salient_weight, s, o);
+                if (salient_scale != nullptr) {
+                    weight *= ggml_nanoquant_get_f32_1d(salient_scale, s);
+                }
+                value += ggml_nanoquant_get_f32_4d(x, idx, i1, i2, i3)*weight;
+            }
+
+            float * out = (float *) ((char *) dst->data + o*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+            *out = value;
+        }
+    }
+}
+
+static void ggml_compute_forward_nanoquant_stage2_fused2_group(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        const ggml_tensor * x,
+        const ggml_tensor * tmp,
+        const ggml_tensor * u_bits,
+        const ggml_tensor * scale_post,
+        const ggml_tensor * salient_idx,
+        const ggml_tensor * salient_weight,
+        int64_t n_rank,
+        int64_t rank_offset,
+        int64_t out_offset) {
+    // The fused output is concatenated by output rows, while tmp is
+    // concatenated by rank rows from fused stage 1.
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t n_out = scale_post->ne[0];
+    const int64_t n_salient = salient_idx == nullptr ? 0 : salient_idx->ne[0];
+
+    const int64_t o0 = (n_out*ith)/nth;
+    const int64_t o1 = (n_out*(ith + 1))/nth;
+    if (o0 >= o1) {
+        return;
+    }
+
+    std::vector<float> post(n_out);
+    for (int64_t o = o0; o < o1; ++o) {
+        post[o] = ggml_nanoquant_get_f32_1d(scale_post, o);
+    }
+
+    const int64_t n_col = dst->ne[1]*dst->ne[2]*dst->ne[3];
+    for (int64_t c = 0; c < n_col; ++c) {
+        const int64_t i3 = c/(dst->ne[1]*dst->ne[2]);
+        const int64_t rem = c - i3*dst->ne[1]*dst->ne[2];
+        const int64_t i2 = rem/dst->ne[1];
+        const int64_t i1 = rem - i2*dst->ne[1];
+
+        for (int64_t o = o0; o < o1; ++o) {
+            float acc = 0.0f;
+            for (int64_t r = 0; r < n_rank; ++r) {
+                const int64_t rr = rank_offset + r;
+                const float tv = *(const float *) ((const char *) tmp->data + rr*tmp->nb[0] + i1*tmp->nb[1] + i2*tmp->nb[2] + i3*tmp->nb[3]);
+                acc += tv * ggml_nanoquant_get_sign(u_bits, o, r);
+            }
+
+            float value = acc * post[o];
+            for (int64_t s = 0; s < n_salient; ++s) {
+                const int64_t idx = ggml_nanoquant_get_i32_1d(salient_idx, s);
+                GGML_ASSERT(idx >= 0 && idx < x->ne[0]);
+                value += ggml_nanoquant_get_f32_4d(x, idx, i1, i2, i3) *
+                    ggml_nanoquant_get_f32_2d(salient_weight, s, o);
+            }
+
+            const int64_t oo = out_offset + o;
+            float * out = (float *) ((char *) dst->data + oo*dst->nb[0] + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+            *out = value;
+        }
+    }
+}
+
+void ggml_compute_forward_nanoquant_stage2_fused2(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x          = dst->src[0];
+    const ggml_tensor * tmp        = dst->src[1];
+    const ggml_tensor * u0         = dst->src[2];
+    const ggml_tensor * post0      = dst->src[3];
+    const ggml_tensor * idx0       = dst->src[4];
+    const ggml_tensor * weight0    = dst->src[5];
+    const ggml_tensor * u1         = dst->src[6];
+    const ggml_tensor * post1      = dst->src[7];
+    const ggml_tensor * idx1       = dst->src[8];
+    const ggml_tensor * weight1    = dst->src[9];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(tmp->type == GGML_TYPE_F32);
+    GGML_ASSERT(u0->type == GGML_TYPE_I32);
+    GGML_ASSERT(u1->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t n_rank0 = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_rank1 = ggml_get_op_params_i32(dst, 1);
+    const int64_t n_out0  = post0->ne[0];
+
+    ggml_compute_forward_nanoquant_stage2_fused2_group(
+        params, dst, x, tmp, u0, post0, idx0, weight0, n_rank0, 0, 0);
+    ggml_compute_forward_nanoquant_stage2_fused2_group(
+        params, dst, x, tmp, u1, post1, idx1, weight1, n_rank1, n_rank0, n_out0);
+}
+
 void ggml_compute_forward_nanoquant_linear(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * x          = dst->src[0];
     const ggml_tensor * v_bits     = dst->src[1];

@@ -1407,6 +1407,49 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     return res;
 }
 
+ggml_tensor * llm_graph_context::build_nanoquant_tmp_view(
+        ggml_tensor * tmp,
+        int64_t rank,
+        int64_t rank_offset) const {
+    // Fused stage 1 concatenates projection ranks; stage 2 still wants a
+    // per-projection rank view without copying tmp.
+    return ggml_view_4d(ctx0, tmp, rank, tmp->ne[1], tmp->ne[2], tmp->ne[3],
+            tmp->nb[1], tmp->nb[2], tmp->nb[3], rank_offset*tmp->nb[0]);
+}
+
+ggml_tensor * llm_graph_context::build_nanoquant_stage2(
+        const llama_nanoquant_weight * nq,
+        ggml_tensor * cur,
+        ggml_tensor * tmp,
+        ggml_tensor * w_s) const {
+    ggml_tensor * res = ggml_nanoquant_stage2(ctx0, cur, tmp, nq->u, nq->scale_post,
+            nq->salient_idx, nq->salient_weight, nq->salient_scale);
+    if (w_s) {
+        res = ggml_mul(ctx0, res, w_s);
+    }
+    return res;
+}
+
+static bool llama_nanoquant_can_fuse_stage2_2way(
+        const llama_nanoquant_weight * a,
+        const llama_nanoquant_weight * b) {
+    // The CUDA fused2 kernel is deliberately specialized to the common decode
+    // shape; broader salient layouts use normal stage-2 kernels.
+    if (a == nullptr || b == nullptr || !a->enabled() || !b->enabled()) {
+        return false;
+    }
+    if (a->salient_scale != nullptr || b->salient_scale != nullptr ||
+            a->salient_idx == nullptr || b->salient_idx == nullptr ||
+            a->salient_weight == nullptr || b->salient_weight == nullptr) {
+        return false;
+    }
+    if (a->salient_idx->ne[0] != 2 || b->salient_idx->ne[0] != 2 ||
+            a->salient_weight->type != GGML_TYPE_F16 || b->salient_weight->type != GGML_TYPE_F16) {
+        return false;
+    }
+    return a->scale_mid->ne[0]%32 == 0 && b->scale_mid->ne[0]%32 == 0;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
@@ -1515,7 +1558,52 @@ llm_graph_qkv llm_graph_context::build_qkv(
             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
     } else {
         // separate Q/K/V path
-        Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
+        bool qk_stage2_fused = false;
+        const llama_nanoquant_weight * nq_q = model == nullptr ? nullptr : model->get_nanoquant_weight(layer.wq);
+        const llama_nanoquant_weight * nq_k = model == nullptr ? nullptr : model->get_nanoquant_weight(layer.wk);
+        const llama_nanoquant_weight * nq_v = model == nullptr ? nullptr : model->get_nanoquant_weight(layer.wv);
+        const bool fuse_nanoquant_qkv = nq_q != nullptr && nq_q->enabled() &&
+            nq_k != nullptr && nq_k->enabled() &&
+            nq_v != nullptr && nq_v->enabled();
+
+        if (fuse_nanoquant_qkv) {
+            ggml_tensor * tmp_qkv = ggml_nanoquant_stage1_fused(ctx0, cur,
+                    nq_q->v, nq_q->scale_pre, nq_q->scale_mid,
+                    nq_k->v, nq_k->scale_pre, nq_k->scale_mid,
+                    nq_v->v, nq_v->scale_pre, nq_v->scale_mid);
+            cb(tmp_qkv, "nq_qkv_stage1", il);
+
+            const int64_t rank_q = nq_q->scale_mid->ne[0];
+            const int64_t rank_k = nq_k->scale_mid->ne[0];
+            const int64_t rank_v = nq_v->scale_mid->ne[0];
+            if (n_tokens == 1 &&
+                    llama_nanoquant_can_fuse_stage2_2way(nq_q, nq_k) &&
+                    layer.wq_s == nullptr && layer.wk_s == nullptr &&
+                    layer.wq_b == nullptr && layer.wk_b == nullptr &&
+                    hparams.f_clamp_kqv <= 0.0f) {
+                // Decode-only: prompt batches use column-tiled stage 2, which
+                // benchmarks faster than the fused2 block fallback.
+                ggml_tensor * qk = ggml_nanoquant_stage2_fused2(ctx0, cur, tmp_qkv,
+                        nq_q->u, nq_q->scale_post, nq_q->salient_idx, nq_q->salient_weight,
+                        nq_k->u, nq_k->scale_post, nq_k->salient_idx, nq_k->salient_weight,
+                        rank_q, rank_k);
+                cb(qk, "nq_qk_stage2", il);
+                Qcur = ggml_view_3d(ctx0, qk, n_embd_head, n_head, n_tokens,
+                        ggml_row_size(qk->type, n_embd_head), qk->nb[1], 0);
+                Kcur = ggml_view_3d(ctx0, qk, n_embd_head, n_head_kv, n_tokens,
+                        ggml_row_size(qk->type, n_embd_head), qk->nb[1], n_embd_q*qk->nb[0]);
+                qk_stage2_fused = true;
+            } else {
+                Qcur = build_nanoquant_stage2(nq_q, cur, build_nanoquant_tmp_view(tmp_qkv, rank_q, 0), layer.wq_s);
+                Kcur = build_nanoquant_stage2(nq_k, cur, build_nanoquant_tmp_view(tmp_qkv, rank_k, rank_q), layer.wk_s);
+            }
+            Vcur = build_nanoquant_stage2(nq_v, cur, build_nanoquant_tmp_view(tmp_qkv, rank_v, rank_q + rank_k), layer.wv_s);
+        } else {
+            Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
+            Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+            Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        }
+
         cb(Qcur, "Qcur", il);
         if (layer.wq_b) {
             Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
@@ -1525,7 +1613,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Qcur, "Qcur_clamped", il);
         }
-        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
         cb(Kcur, "Kcur", il);
         if (layer.wk_b) {
             Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
@@ -1535,7 +1622,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Kcur, "Kcur_clamped", il);
         }
-        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
         cb(Vcur, "Vcur", il);
         if (layer.wv_b) {
             Vcur = ggml_add(ctx0, Vcur, layer.wv_b);
@@ -1545,8 +1631,10 @@ llm_graph_qkv llm_graph_context::build_qkv(
             Vcur = ggml_clamp(ctx0, Vcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
             cb(Vcur, "Vcur_clamped", il);
         }
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
-        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        if (!qk_stage2_fused) {
+            Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        }
         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     }
 
@@ -1597,8 +1685,41 @@ ggml_tensor * llm_graph_context::build_ffn(
     GGML_ASSERT(!down_s || !down || down->type != GGML_TYPE_NVFP4 || !has_lora(down));
 
     const bool has_gate = gate != nullptr;
+    const llama_nanoquant_weight * nq_up   = model == nullptr ? nullptr : model->get_nanoquant_weight(up);
+    const llama_nanoquant_weight * nq_gate = model == nullptr ? nullptr : model->get_nanoquant_weight(gate);
+    const bool fuse_nanoquant_gate_up = has_gate && type_gate == LLM_FFN_PAR &&
+        nq_up != nullptr && nq_up->enabled() &&
+        nq_gate != nullptr && nq_gate->enabled();
 
-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+    ggml_tensor * tmp = nullptr;
+    if (fuse_nanoquant_gate_up) {
+        ggml_tensor * tmp_gate_up = ggml_nanoquant_stage1_fused(ctx0, cur,
+                nq_up->v,   nq_up->scale_pre,   nq_up->scale_mid,
+                nq_gate->v, nq_gate->scale_pre, nq_gate->scale_mid,
+                nullptr, nullptr, nullptr);
+        cb(tmp_gate_up, "nq_gate_up_stage1", il);
+
+        const int64_t rank_up = nq_up->scale_mid->ne[0];
+        const int64_t rank_gate = nq_gate->scale_mid->ne[0];
+        if (n_tokens == 1 && llama_nanoquant_can_fuse_stage2_2way(nq_up, nq_gate)) {
+            // Decode-only for the same reason as Q/K: prefill is handled by
+            // the regular stage-2 op's column-tiled CUDA path.
+            ggml_tensor * up_gate = ggml_nanoquant_stage2_fused2(ctx0, cur, tmp_gate_up,
+                    nq_up->u,   nq_up->scale_post,   nq_up->salient_idx,   nq_up->salient_weight,
+                    nq_gate->u, nq_gate->scale_post, nq_gate->salient_idx, nq_gate->salient_weight,
+                    rank_up, rank_gate);
+            cb(up_gate, "nq_up_gate_stage2", il);
+            tmp = ggml_view_4d(ctx0, up_gate, nq_up->scale_post->ne[0], up_gate->ne[1], up_gate->ne[2], up_gate->ne[3],
+                    up_gate->nb[1], up_gate->nb[2], up_gate->nb[3], 0);
+            cur = ggml_view_4d(ctx0, up_gate, nq_gate->scale_post->ne[0], up_gate->ne[1], up_gate->ne[2], up_gate->ne[3],
+                    up_gate->nb[1], up_gate->nb[2], up_gate->nb[3], nq_up->scale_post->ne[0]*up_gate->nb[0]);
+        } else {
+            tmp = build_nanoquant_stage2(nq_up, cur, build_nanoquant_tmp_view(tmp_gate_up, rank_up, 0));
+            cur = build_nanoquant_stage2(nq_gate, cur, build_nanoquant_tmp_view(tmp_gate_up, rank_gate, rank_up));
+        }
+    } else {
+        tmp = up ? build_lora_mm(up, cur) : cur;
+    }
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -1612,17 +1733,21 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (has_gate) {
-        switch (type_gate) {
-            case LLM_FFN_SEQ:
-                {
-                    cur = build_lora_mm(gate, tmp);
-                    cb(cur, "ffn_gate", il);
-                } break;
-            case LLM_FFN_PAR:
-                {
-                    cur = build_lora_mm(gate, cur);
-                    cb(cur, "ffn_gate", il);
-                } break;
+        if (fuse_nanoquant_gate_up) {
+            cb(cur, "ffn_gate", il);
+        } else {
+            switch (type_gate) {
+                case LLM_FFN_SEQ:
+                    {
+                        cur = build_lora_mm(gate, tmp);
+                        cb(cur, "ffn_gate", il);
+                    } break;
+                case LLM_FFN_PAR:
+                    {
+                        cur = build_lora_mm(gate, cur);
+                        cb(cur, "ffn_gate", il);
+                    } break;
+            }
         }
 
         if (gate_b) {

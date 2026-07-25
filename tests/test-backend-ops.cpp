@@ -4245,6 +4245,8 @@ struct test_nanoquant_linear : public test_case {
     const int64_t n_col;
     const int64_t n_salient;
     const bool    int8_outliers;
+    const bool    f16_outliers;
+    const ggml_type scale_type;
 
     test_nanoquant_linear(
             int64_t n_in,
@@ -4252,18 +4254,24 @@ struct test_nanoquant_linear : public test_case {
             int64_t n_out,
             int64_t n_col,
             int64_t n_salient = 0,
-            bool    int8_outliers = false)
+            bool    int8_outliers = false,
+            bool    f16_outliers = false,
+            ggml_type scale_type = GGML_TYPE_F32)
         : n_in(n_in),
           n_rank(n_rank),
           n_out(n_out),
           n_col(n_col),
           n_salient(n_salient),
-          int8_outliers(int8_outliers) {
+          int8_outliers(int8_outliers),
+          f16_outliers(f16_outliers),
+          scale_type(scale_type) {
         GGML_ASSERT(n_salient > 0 || !int8_outliers);
+        GGML_ASSERT(!int8_outliers || !f16_outliers);
+        GGML_ASSERT(scale_type == GGML_TYPE_F32 || scale_type == GGML_TYPE_BF16);
     }
 
     std::string vars() override {
-        return VARS_TO_STR6(n_in, n_rank, n_out, n_col, n_salient, int8_outliers);
+        return VARS_TO_STR8(n_in, n_rank, n_out, n_col, n_salient, int8_outliers, f16_outliers, scale_type);
     }
 
     double max_nmse_err() override {
@@ -4281,9 +4289,9 @@ struct test_nanoquant_linear : public test_case {
         ggml_tensor * x          = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_col);
         ggml_tensor * v_bits     = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (n_in   + 31)/32, n_rank);
         ggml_tensor * u_bits     = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, (n_rank + 31)/32, n_out);
-        ggml_tensor * scale_pre  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_in);
-        ggml_tensor * scale_mid  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_rank);
-        ggml_tensor * scale_post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_out);
+        ggml_tensor * scale_pre  = ggml_new_tensor_1d(ctx, scale_type, n_in);
+        ggml_tensor * scale_mid  = ggml_new_tensor_1d(ctx, scale_type, n_rank);
+        ggml_tensor * scale_post = ggml_new_tensor_1d(ctx, scale_type, n_out);
 
         ggml_set_name(x,          "x");
         ggml_set_name(v_bits,     "v_bits");
@@ -4297,7 +4305,8 @@ struct test_nanoquant_linear : public test_case {
         ggml_tensor * salient_scale  = nullptr;
         if (n_salient > 0) {
             salient_idx    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_salient);
-            salient_weight = ggml_new_tensor_2d(ctx, int8_outliers ? GGML_TYPE_I8 : GGML_TYPE_F32, n_salient, n_out);
+            const ggml_type salient_weight_type = int8_outliers ? GGML_TYPE_I8 : (f16_outliers ? GGML_TYPE_F16 : GGML_TYPE_F32);
+            salient_weight = ggml_new_tensor_2d(ctx, salient_weight_type, n_salient, n_out);
 
             ggml_set_name(salient_idx,    "salient_idx");
             ggml_set_name(salient_weight, "salient_weight");
@@ -4340,19 +4349,37 @@ struct test_nanoquant_linear : public test_case {
                 for (int64_t i = 0; i < t->ne[0]; ++i) {
                     data[i] = 0.5f + 0.01f*(float) (i%17);
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                if (t->type == GGML_TYPE_BF16) {
+                    std::vector<ggml_bf16_t> data_bf16(data.size());
+                    ggml_fp32_to_bf16_row_ref(data.data(), data_bf16.data(), data_bf16.size());
+                    ggml_backend_tensor_set(t, data_bf16.data(), 0, data_bf16.size()*sizeof(ggml_bf16_t));
+                } else {
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                }
             } else if (strcmp(t->name, "scale_mid") == 0) {
                 std::vector<float> data(ggml_nelements(t));
                 for (int64_t i = 0; i < t->ne[0]; ++i) {
                     data[i] = 0.75f + 0.015f*(float) (i%11);
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                if (t->type == GGML_TYPE_BF16) {
+                    std::vector<ggml_bf16_t> data_bf16(data.size());
+                    ggml_fp32_to_bf16_row_ref(data.data(), data_bf16.data(), data_bf16.size());
+                    ggml_backend_tensor_set(t, data_bf16.data(), 0, data_bf16.size()*sizeof(ggml_bf16_t));
+                } else {
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                }
             } else if (strcmp(t->name, "scale_post") == 0) {
                 std::vector<float> data(ggml_nelements(t));
                 for (int64_t i = 0; i < t->ne[0]; ++i) {
                     data[i] = 0.25f + 0.02f*(float) (i%13);
                 }
-                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                if (t->type == GGML_TYPE_BF16) {
+                    std::vector<ggml_bf16_t> data_bf16(data.size());
+                    ggml_fp32_to_bf16_row_ref(data.data(), data_bf16.data(), data_bf16.size());
+                    ggml_backend_tensor_set(t, data_bf16.data(), 0, data_bf16.size()*sizeof(ggml_bf16_t));
+                } else {
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                }
             } else if (strcmp(t->name, "salient_idx") == 0) {
                 std::vector<int32_t> data(ggml_nelements(t));
                 for (int64_t i = 0; i < t->ne[0]; ++i) {
@@ -4367,6 +4394,16 @@ struct test_nanoquant_linear : public test_case {
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else if (strcmp(t->name, "salient_weight") == 0 && t->type == GGML_TYPE_F16) {
+                std::vector<float> data_f32(ggml_nelements(t));
+                std::vector<ggml_fp16_t> data_f16(ggml_nelements(t));
+                for (int64_t o = 0; o < t->ne[1]; ++o) {
+                    for (int64_t s = 0; s < t->ne[0]; ++s) {
+                        data_f32[o*t->ne[0] + s] = ((o*5 + s*3)%19 - 9)*0.0078125f;
+                    }
+                }
+                ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
+                ggml_backend_tensor_set(t, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
             } else if (strcmp(t->name, "salient_weight") == 0 && t->type == GGML_TYPE_I8) {
                 std::vector<int8_t> data(ggml_nelements(t));
                 for (int64_t o = 0; o < t->ne[1]; ++o) {
@@ -4390,6 +4427,154 @@ struct test_nanoquant_linear : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_NANOQUANT_LINEAR);
+    }
+};
+
+struct test_nanoquant_stage1_fused : public test_case {
+    const int64_t n_col;
+
+    test_nanoquant_stage1_fused(int64_t n_col) : n_col(n_col) {}
+
+    std::string vars() override {
+        return VARS_TO_STR1(n_col);
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        constexpr int64_t n_in = 64;
+        constexpr int64_t n_rank_total = 32 + 64 + 32;
+        return 2*n_col*n_in*n_rank_total;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t n_in = 64;
+        constexpr int64_t ranks[3] = { 32, 64, 32 };
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_col);
+        ggml_tensor * v[3];
+        ggml_tensor * pre[3];
+        ggml_tensor * mid[3];
+        for (int i = 0; i < 3; ++i) {
+            v[i]   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_in/32, ranks[i]);
+            pre[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, n_in);
+            mid[i] = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, ranks[i]);
+        }
+
+        ggml_set_name(x, "x");
+        ggml_set_name(v[0], "v0");
+        ggml_set_name(pre[0], "pre0");
+        ggml_set_name(mid[0], "mid0");
+        ggml_set_name(v[1], "v1");
+        ggml_set_name(pre[1], "pre1");
+        ggml_set_name(mid[1], "mid1");
+        ggml_set_name(v[2], "v2");
+        ggml_set_name(pre[2], "pre2");
+        ggml_set_name(mid[2], "mid2");
+
+        ggml_tensor * out = ggml_nanoquant_stage1_fused(
+            ctx, x,
+            v[0], pre[0], mid[0],
+            v[1], pre[1], mid[1],
+            v[2], pre[2], mid[2]);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.5f, 0.5f);
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_NANOQUANT_STAGE1_FUSED);
+    }
+};
+
+struct test_nanoquant_stage2_fused2 : public test_case {
+    const int64_t n_col;
+
+    test_nanoquant_stage2_fused2(int64_t n_col) : n_col(n_col) {}
+
+    std::string vars() override {
+        return VARS_TO_STR1(n_col);
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        constexpr int64_t n_rank0 = 32;
+        constexpr int64_t n_rank1 = 64;
+        constexpr int64_t n_out0  = 48;
+        constexpr int64_t n_out1  = 32;
+        constexpr int64_t n_salient = 2;
+        return 2*n_col*(n_out0*(n_rank0 + n_salient) + n_out1*(n_rank1 + n_salient));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int64_t n_in    = 64;
+        constexpr int64_t n_rank0 = 32;
+        constexpr int64_t n_rank1 = 64;
+        constexpr int64_t n_out0  = 48;
+        constexpr int64_t n_out1  = 32;
+        constexpr int64_t n_salient = 2;
+
+        ggml_tensor * x       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_in, n_col);
+        ggml_tensor * tmp     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_rank0 + n_rank1, n_col);
+        ggml_tensor * u0      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_rank0/32, n_out0);
+        ggml_tensor * post0   = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, n_out0);
+        ggml_tensor * idx0    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_salient);
+        ggml_tensor * weight0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_salient, n_out0);
+        ggml_tensor * u1      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_rank1/32, n_out1);
+        ggml_tensor * post1   = ggml_new_tensor_1d(ctx, GGML_TYPE_BF16, n_out1);
+        ggml_tensor * idx1    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_salient);
+        ggml_tensor * weight1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_salient, n_out1);
+
+        ggml_set_name(x,       "x");
+        ggml_set_name(tmp,     "tmp");
+        ggml_set_name(u0,      "u0");
+        ggml_set_name(post0,   "post0");
+        ggml_set_name(idx0,    "idx0");
+        ggml_set_name(weight0, "weight0");
+        ggml_set_name(u1,      "u1");
+        ggml_set_name(post1,   "post1");
+        ggml_set_name(idx1,    "idx1");
+        ggml_set_name(weight1, "weight1");
+
+        ggml_tensor * out = ggml_nanoquant_stage2_fused2(
+            ctx, x, tmp,
+            u0, post0, idx0, weight0,
+            u1, post1, idx1, weight1,
+            n_rank0, n_rank1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx0") == 0 || strcmp(t->name, "idx1") == 0) {
+                const int32_t data[2] = {
+                    strcmp(t->name, "idx0") == 0 ? 3 : 5,
+                    strcmp(t->name, "idx0") == 0 ? 17 : 29,
+                };
+                ggml_backend_tensor_set(t, data, 0, sizeof(data));
+            } else {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            }
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_NANOQUANT_STAGE2_FUSED2);
     }
 };
 
@@ -8689,6 +8874,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_nanoquant_linear(32, 16, 24, 1));
     test_cases.emplace_back(new test_nanoquant_linear(33, 17, 25, 1, 3));
     test_cases.emplace_back(new test_nanoquant_linear(64, 32, 48, 4, 4, true));
+    test_cases.emplace_back(new test_nanoquant_linear(64, 32, 48, 8, 2, false, true));
+    test_cases.emplace_back(new test_nanoquant_linear(96, 64, 64, 8, 7, false, true));
+    test_cases.emplace_back(new test_nanoquant_linear(64, 32, 48, 1, 2, false, true, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_nanoquant_linear(64, 32, 48, 8, 2, false, true, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_nanoquant_stage1_fused(1));
+    test_cases.emplace_back(new test_nanoquant_stage1_fused(8));
+    test_cases.emplace_back(new test_nanoquant_stage2_fused2(1));
+    test_cases.emplace_back(new test_nanoquant_stage2_fused2(8));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

@@ -1845,6 +1845,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_nanoquant_linear(params, tensor);
             } break;
+        case GGML_OP_NANOQUANT_STAGE1_FUSED:
+            {
+                ggml_compute_forward_nanoquant_stage1_fused(params, tensor);
+            } break;
+        case GGML_OP_NANOQUANT_STAGE2:
+            {
+                ggml_compute_forward_nanoquant_stage2(params, tensor);
+            } break;
+        case GGML_OP_NANOQUANT_STAGE2_FUSED2:
+            {
+                ggml_compute_forward_nanoquant_stage2_fused2(params, tensor);
+            } break;
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -2315,6 +2327,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_NANOQUANT_LINEAR:
+        case GGML_OP_NANOQUANT_STAGE1_FUSED:
+        case GGML_OP_NANOQUANT_STAGE2:
+        case GGML_OP_NANOQUANT_STAGE2_FUSED2:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;

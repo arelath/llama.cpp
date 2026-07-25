@@ -1022,6 +1022,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT",
     "MUL_MAT_ID",
     "NANOQUANT_LINEAR",
+    "NANOQUANT_STAGE1_FUSED",
+    "NANOQUANT_STAGE2",
+    "NANOQUANT_STAGE2_FUSED2",
     "OUT_PROD",
 
     "SCALE",
@@ -1097,7 +1100,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1134,6 +1137,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X*Y",
     "X[i]*Y",
     "nq_linear(x)",
+    "nq_stage1(x)",
+    "nq_stage2(x)",
+    "nq_stage2_fused2(x)",
     "X*Y",
 
     "x*v",
@@ -1209,7 +1215,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3339,6 +3345,193 @@ struct ggml_tensor * ggml_nanoquant_linear(
     result->src[6] = salient_idx;
     result->src[7] = salient_weight;
     result->src[8] = salient_scale;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_nanoquant_stage1_fused(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * v0,
+        struct ggml_tensor  * scale_pre0,
+        struct ggml_tensor  * scale_mid0,
+        struct ggml_tensor  * v1,
+        struct ggml_tensor  * scale_pre1,
+        struct ggml_tensor  * scale_mid1,
+        struct ggml_tensor  * v2,
+        struct ggml_tensor  * scale_pre2,
+        struct ggml_tensor  * scale_mid2) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_BF16);
+
+    // Up to three projections fit in GGML_MAX_SRC as triplets
+    // (sign bits, pre scale, mid scale); callers pass NULL triplets for fewer.
+    struct ggml_tensor * const v[3]   = { v0, v1, v2 };
+    struct ggml_tensor * const pre[3] = { scale_pre0, scale_pre1, scale_pre2 };
+    struct ggml_tensor * const mid[3] = { scale_mid0, scale_mid1, scale_mid2 };
+
+    const int64_t n_in = x->ne[0];
+    int64_t n_rank_total = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (v[i] == NULL) {
+            GGML_ASSERT(pre[i] == NULL);
+            GGML_ASSERT(mid[i] == NULL);
+            continue;
+        }
+
+        GGML_ASSERT(v[i]->type == GGML_TYPE_I32);
+        GGML_ASSERT(pre[i]->type == GGML_TYPE_F32 || pre[i]->type == GGML_TYPE_F16 || pre[i]->type == GGML_TYPE_BF16);
+        GGML_ASSERT(mid[i]->type == GGML_TYPE_F32 || mid[i]->type == GGML_TYPE_F16 || mid[i]->type == GGML_TYPE_BF16);
+        GGML_ASSERT(pre[i]->ne[0] == n_in);
+        GGML_ASSERT(v[i]->ne[0] == (n_in + 31)/32);
+        GGML_ASSERT(v[i]->ne[1] == mid[i]->ne[0]);
+        n_rank_total += mid[i]->ne[0];
+    }
+    GGML_ASSERT(n_rank_total > 0);
+
+    const int64_t ne[4] = { n_rank_total, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_NANOQUANT_STAGE1_FUSED;
+    result->src[0] = x;
+    result->src[1] = v0;
+    result->src[2] = scale_pre0;
+    result->src[3] = scale_mid0;
+    result->src[4] = v1;
+    result->src[5] = scale_pre1;
+    result->src[6] = scale_mid1;
+    result->src[7] = v2;
+    result->src[8] = scale_pre2;
+    result->src[9] = scale_mid2;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_nanoquant_stage2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * tmp,
+        struct ggml_tensor  * u_bits,
+        struct ggml_tensor  * scale_post,
+        struct ggml_tensor  * salient_idx,
+        struct ggml_tensor  * salient_weight,
+        struct ggml_tensor  * salient_scale) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_BF16);
+    GGML_ASSERT(tmp->type == GGML_TYPE_F32);
+    GGML_ASSERT(u_bits->type == GGML_TYPE_I32);
+    GGML_ASSERT(scale_post->type == GGML_TYPE_F32 || scale_post->type == GGML_TYPE_F16 || scale_post->type == GGML_TYPE_BF16);
+
+    const int64_t n_rank = tmp->ne[0];
+    const int64_t n_out  = scale_post->ne[0];
+
+    GGML_ASSERT(u_bits->ne[0] == (n_rank + 31)/32);
+    GGML_ASSERT(u_bits->ne[1] == n_out);
+    GGML_ASSERT((salient_idx == NULL) == (salient_weight == NULL));
+    GGML_ASSERT(salient_scale == NULL || salient_weight != NULL);
+
+    if (salient_idx != NULL) {
+        const int64_t n_salient = salient_idx->ne[0];
+        GGML_ASSERT(salient_idx->type == GGML_TYPE_I32);
+        GGML_ASSERT(salient_weight->ne[0] == n_salient);
+        GGML_ASSERT(salient_weight->ne[1] == n_out);
+        if (salient_scale != NULL) {
+            GGML_ASSERT(salient_weight->type == GGML_TYPE_I8);
+            GGML_ASSERT(salient_scale->type == GGML_TYPE_F32 ||
+                        salient_scale->type == GGML_TYPE_F16 ||
+                        salient_scale->type == GGML_TYPE_BF16);
+            GGML_ASSERT(salient_scale->ne[0] == n_salient);
+        } else {
+            GGML_ASSERT(salient_weight->type == GGML_TYPE_F32 ||
+                        salient_weight->type == GGML_TYPE_F16 ||
+                        salient_weight->type == GGML_TYPE_BF16);
+        }
+    }
+
+    const int64_t ne[4] = { n_out, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_NANOQUANT_STAGE2;
+    result->src[0] = x;
+    result->src[1] = tmp;
+    result->src[2] = u_bits;
+    result->src[3] = scale_post;
+    result->src[4] = salient_idx;
+    result->src[5] = salient_weight;
+    result->src[6] = salient_scale;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_nanoquant_stage2_fused2(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * tmp,
+        struct ggml_tensor  * u0,
+        struct ggml_tensor  * scale_post0,
+        struct ggml_tensor  * salient_idx0,
+        struct ggml_tensor  * salient_weight0,
+        struct ggml_tensor  * u1,
+        struct ggml_tensor  * scale_post1,
+        struct ggml_tensor  * salient_idx1,
+        struct ggml_tensor  * salient_weight1,
+        int64_t               n_rank0,
+        int64_t               n_rank1) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 || x->type == GGML_TYPE_F16 || x->type == GGML_TYPE_BF16);
+    GGML_ASSERT(tmp->type == GGML_TYPE_F32);
+    GGML_ASSERT(u0->type == GGML_TYPE_I32);
+    GGML_ASSERT(u1->type == GGML_TYPE_I32);
+    GGML_ASSERT(scale_post0->type == GGML_TYPE_F32 || scale_post0->type == GGML_TYPE_F16 || scale_post0->type == GGML_TYPE_BF16);
+    GGML_ASSERT(scale_post1->type == GGML_TYPE_F32 || scale_post1->type == GGML_TYPE_F16 || scale_post1->type == GGML_TYPE_BF16);
+    GGML_ASSERT(n_rank0 > 0);
+    GGML_ASSERT(n_rank1 > 0);
+    GGML_ASSERT(tmp->ne[0] >= n_rank0 + n_rank1);
+
+    const int64_t n_out0 = scale_post0->ne[0];
+    const int64_t n_out1 = scale_post1->ne[0];
+
+    GGML_ASSERT(u0->ne[0] == (n_rank0 + 31)/32);
+    GGML_ASSERT(u0->ne[1] == n_out0);
+    GGML_ASSERT(u1->ne[0] == (n_rank1 + 31)/32);
+    GGML_ASSERT(u1->ne[1] == n_out1);
+    GGML_ASSERT((salient_idx0 == NULL) == (salient_weight0 == NULL));
+    GGML_ASSERT((salient_idx1 == NULL) == (salient_weight1 == NULL));
+
+    if (salient_idx0 != NULL) {
+        const int64_t n_salient = salient_idx0->ne[0];
+        GGML_ASSERT(salient_idx0->type == GGML_TYPE_I32);
+        GGML_ASSERT(salient_weight0->type == GGML_TYPE_F32 ||
+                    salient_weight0->type == GGML_TYPE_F16 ||
+                    salient_weight0->type == GGML_TYPE_BF16);
+        GGML_ASSERT(salient_weight0->ne[0] == n_salient);
+        GGML_ASSERT(salient_weight0->ne[1] == n_out0);
+    }
+    if (salient_idx1 != NULL) {
+        const int64_t n_salient = salient_idx1->ne[0];
+        GGML_ASSERT(salient_idx1->type == GGML_TYPE_I32);
+        GGML_ASSERT(salient_weight1->type == GGML_TYPE_F32 ||
+                    salient_weight1->type == GGML_TYPE_F16 ||
+                    salient_weight1->type == GGML_TYPE_BF16);
+        GGML_ASSERT(salient_weight1->ne[0] == n_salient);
+        GGML_ASSERT(salient_weight1->ne[1] == n_out1);
+    }
+
+    const int64_t ne[4] = { n_out0 + n_out1, x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    // Rank offsets cannot be inferred from output shape, so keep them as op params.
+    ggml_set_op_params_i32(result, 0, (int32_t) n_rank0);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_rank1);
+
+    result->op     = GGML_OP_NANOQUANT_STAGE2_FUSED2;
+    result->src[0] = x;
+    result->src[1] = tmp;
+    result->src[2] = u0;
+    result->src[3] = scale_post0;
+    result->src[4] = salient_idx0;
+    result->src[5] = salient_weight0;
+    result->src[6] = u1;
+    result->src[7] = scale_post1;
+    result->src[8] = salient_idx1;
+    result->src[9] = salient_weight1;
 
     return result;
 }
@@ -6699,7 +6892,10 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
-        case GGML_OP_NANOQUANT_LINEAR: {
+        case GGML_OP_NANOQUANT_LINEAR:
+        case GGML_OP_NANOQUANT_STAGE1_FUSED:
+        case GGML_OP_NANOQUANT_STAGE2:
+        case GGML_OP_NANOQUANT_STAGE2_FUSED2: {
             GGML_ASSERT(!src0_needs_grads && !src1_needs_grads && !src2_needs_grads);
         } break;
         case GGML_OP_SCALE: {
