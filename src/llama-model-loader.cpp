@@ -704,6 +704,46 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    uint32_t nanoquant_version = 0;
+    get_key("quantization.nanoquant.version", nanoquant_version, false);
+    if (nanoquant_version > 3) {
+        throw std::runtime_error("unsupported NanoQuant format version");
+    }
+    if (nanoquant_version == 3) {
+        std::string stage_format;
+        get_key("quantization.nanoquant.stage_format", stage_format);
+        if (stage_format != "additive_binary_v1") {
+            throw std::runtime_error("unsupported NanoQuant residual stage format");
+        }
+    }
+    for (const auto & item : weights_map) {
+        const std::string & name = item.first;
+        const size_t marker = name.find(".nq_residual_");
+        const size_t primary_marker = name.find(".nq_stage0_");
+        if (marker == std::string::npos && primary_marker == std::string::npos) {
+            continue;
+        }
+        if (nanoquant_version != 3) {
+            throw std::runtime_error("residual NanoQuant tensor requires format version 3");
+        }
+        const std::string base = name.substr(0, marker == std::string::npos ? primary_marker : marker);
+        uint32_t count = 0;
+        get_key("quantization.nanoquant." + base + ".residual_stage_count", count);
+        if (count == 0 || count > 65536 || weights_map.count(base + ".nq_stage0_v") != 1) {
+            throw std::runtime_error("invalid or orphan NanoQuant residual stage inventory");
+        }
+        if (marker != std::string::npos) {
+            const size_t start = marker + strlen(".nq_residual_");
+            const size_t end = name.find('_', start);
+            const std::string index = name.substr(start, end - start);
+            if (end == std::string::npos || index.empty() || index.size() > 5 ||
+                    index.find_first_not_of("0123456789") != std::string::npos ||
+                    (index.size() > 1 && index[0] == '0') || std::stoul(index) >= count) {
+                throw std::runtime_error("invalid NanoQuant residual stage index");
+            }
+        }
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -1052,6 +1092,10 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 }
 
 static bool is_nanoquant_sidecar(const char * suffix) {
+    if (suffix != nullptr &&
+            (strncmp(suffix, "nq_residual_", 12) == 0 || strncmp(suffix, "nq_stage0_", 10) == 0)) {
+        return true;
+    }
     return suffix != nullptr && (
         strcmp(suffix, "nq_v") == 0 ||
         strcmp(suffix, "nq_u") == 0 ||
@@ -1218,6 +1262,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 // them with the preferred layer buffer instead of probing each I32 or
                 // scale tensor as if it were a standalone MUL_MAT weight.
                 buft = buft_list->front().second;
+                auto * device = ggml_backend_buft_get_device(buft);
+                if (device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    // Packed signs are raw I32 words, not repackable matmul weights.
+                    buft = ggml_backend_cpu_buffer_type();
+                }
             } else {
                 buft = select_weight_buft(hparams, t_meta, op, buft_list);
             }

@@ -1370,6 +1370,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         ggml_tensor * res = ggml_nanoquant_linear(ctx0, cur,
                 nq->v, nq->u, nq->scale_pre, nq->scale_mid, nq->scale_post,
                 nq->salient_idx, nq->salient_weight, nq->salient_scale);
+        for (const auto & stage : nq->residual_stages) {
+            res = ggml_add(ctx0, res, ggml_nanoquant_linear(ctx0, cur,
+                    stage.v, stage.u, stage.scale_pre, stage.scale_mid, stage.scale_post,
+                    nullptr, nullptr, nullptr));
+        }
         if (w_s) {
             res = ggml_mul(ctx0, res, w_s);
         }
@@ -1564,7 +1569,8 @@ llm_graph_qkv llm_graph_context::build_qkv(
         const llama_nanoquant_weight * nq_v = model == nullptr ? nullptr : model->get_nanoquant_weight(layer.wv);
         const bool fuse_nanoquant_qkv = nq_q != nullptr && nq_q->enabled() &&
             nq_k != nullptr && nq_k->enabled() &&
-            nq_v != nullptr && nq_v->enabled();
+            nq_v != nullptr && nq_v->enabled() &&
+            nq_q->residual_stages.empty() && nq_k->residual_stages.empty() && nq_v->residual_stages.empty();
 
         if (fuse_nanoquant_qkv) {
             ggml_tensor * tmp_qkv = ggml_nanoquant_stage1_fused(ctx0, cur,
@@ -1689,7 +1695,8 @@ ggml_tensor * llm_graph_context::build_ffn(
     const llama_nanoquant_weight * nq_gate = model == nullptr ? nullptr : model->get_nanoquant_weight(gate);
     const bool fuse_nanoquant_gate_up = has_gate && type_gate == LLM_FFN_PAR &&
         nq_up != nullptr && nq_up->enabled() &&
-        nq_gate != nullptr && nq_gate->enabled();
+        nq_gate != nullptr && nq_gate->enabled() &&
+        nq_up->residual_stages.empty() && nq_gate->residual_stages.empty();
 
     ggml_tensor * tmp = nullptr;
     if (fuse_nanoquant_gate_up) {

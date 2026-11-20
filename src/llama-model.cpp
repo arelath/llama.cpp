@@ -2756,23 +2756,15 @@ ggml_tensor * llama_model_base::create_tensor_as_nanoquant(const LLM_TN_IMPL & w
         return nullptr;
     }
 
-    const LLM_TN_IMPL v_tn          (weight_tn.arch, weight_tn.tensor, "nq_v",          weight_tn.bid, weight_tn.xid);
-    const LLM_TN_IMPL u_tn          (weight_tn.arch, weight_tn.tensor, "nq_u",          weight_tn.bid, weight_tn.xid);
-    const LLM_TN_IMPL scale_pre_tn  (weight_tn.arch, weight_tn.tensor, "nq_scale_pre",  weight_tn.bid, weight_tn.xid);
-    const LLM_TN_IMPL scale_mid_tn  (weight_tn.arch, weight_tn.tensor, "nq_scale_mid",  weight_tn.bid, weight_tn.xid);
-    const LLM_TN_IMPL scale_post_tn (weight_tn.arch, weight_tn.tensor, "nq_scale_post", weight_tn.bid, weight_tn.xid);
-    const LLM_TN_IMPL salient_idx_tn    (weight_tn.arch, weight_tn.tensor, "nq_salient_idx",    weight_tn.bid, weight_tn.xid);
-    const LLM_TN_IMPL salient_weight_tn (weight_tn.arch, weight_tn.tensor, "nq_salient_weight", weight_tn.bid, weight_tn.xid);
-    const LLM_TN_IMPL salient_scale_tn  (weight_tn.arch, weight_tn.tensor, "nq_salient_scale",  weight_tn.bid, weight_tn.xid);
-
-    if (ml->get_tensor_meta(v_tn.str().c_str()) == nullptr) {
+    const LLM_TN_IMPL stage0_v_tn(weight_tn.arch, weight_tn.tensor, "nq_stage0_v", weight_tn.bid, weight_tn.xid);
+    const LLM_TN_IMPL primary_v_tn(weight_tn.arch, weight_tn.tensor, "nq_v", weight_tn.bid, weight_tn.xid);
+    const bool staged = ml->get_tensor_meta(stage0_v_tn.str().c_str()) != nullptr;
+    if (!staged && ml->get_tensor_meta(primary_v_tn.str().c_str()) == nullptr) {
         return nullptr;
     }
-
-    // A complete NanoQuant tensor group replaces the dense .weight tensor while
-    // preserving the original tensor name as a virtual lookup key for graph code.
-    llama_nanoquant_weight nq;
-
+    if (staged && ml->get_tensor_meta(primary_v_tn.str().c_str()) != nullptr) {
+        throw std::runtime_error("conflicting primary and residual NanoQuant representations");
+    }
     std::vector<int64_t> weight_ne(ne);
     if (weight_ne.size() != 2) {
         throw std::runtime_error(format("%s: NanoQuant tensor '%s' must describe a 2D weight", __func__, weight_tn.str().c_str()));
@@ -2780,71 +2772,130 @@ ggml_tensor * llama_model_base::create_tensor_as_nanoquant(const LLM_TN_IMPL & w
 
     const int64_t n_in  = weight_ne[0];
     const int64_t n_out = weight_ne[1];
-    const auto * scale_mid_meta = ml->require_tensor_meta(scale_mid_tn.str());
-    const int64_t n_rank = scale_mid_meta->ne[0];
-
-    const int64_t n_words_in   = (n_in + 31)/32;
-    const int64_t n_words_rank = (n_rank + 31)/32;
-
-    const auto * salient_idx_meta    = ml->get_tensor_meta(salient_idx_tn.str().c_str());
-    const auto * salient_weight_meta = ml->get_tensor_meta(salient_weight_tn.str().c_str());
-    const auto * salient_scale_meta  = ml->get_tensor_meta(salient_scale_tn.str().c_str());
-    const bool has_salient_idx    = salient_idx_meta != nullptr;
-    const bool has_salient_weight = salient_weight_meta != nullptr;
-    const bool has_salient_scale  = salient_scale_meta != nullptr;
-
-    // Outlier weights form an optional side path, but idx and weight must still
-    // appear together so the op never has to infer a partial representation.
-    if (has_salient_idx != has_salient_weight) {
-        throw std::runtime_error(format("%s: NanoQuant tensor '%s' has an incomplete salient outlier group",
-                    __func__, weight_tn.str().c_str()));
-    }
-    if (has_salient_scale && !has_salient_weight) {
-        throw std::runtime_error(format("%s: NanoQuant tensor '%s' has a salient scale without salient weights",
-                    __func__, weight_tn.str().c_str()));
-    }
-
-    const int sidecar_flags = flags & ~TENSOR_NOT_REQUIRED;
-
-    nq.v          = create_tensor(*ml, v_tn,          { n_words_in,   n_rank }, sidecar_flags);
-    nq.u          = create_tensor(*ml, u_tn,          { n_words_rank, n_out  }, sidecar_flags);
-    nq.scale_pre  = create_tensor(*ml, scale_pre_tn,  { n_in   }, sidecar_flags);
-    nq.scale_mid  = create_tensor(*ml, scale_mid_tn,  { n_rank }, sidecar_flags);
-    nq.scale_post = create_tensor(*ml, scale_post_tn, { n_out  }, sidecar_flags);
-
-    if (has_salient_idx) {
-        const int64_t n_salient = salient_idx_meta->ne[0];
-        if (salient_idx_meta->type != GGML_TYPE_I32) {
-            throw std::runtime_error(format("%s: tensor '%s' must be I32",
-                        __func__, salient_idx_tn.str().c_str()));
+    auto load_term = [&](const std::string & prefix) {
+        const std::string suffix_v = prefix + "_v";
+        const LLM_TN_IMPL v_tn          (weight_tn.arch, weight_tn.tensor, suffix_v.c_str(),          weight_tn.bid, weight_tn.xid);
+        const std::string suffix_u = prefix + "_u";
+        const LLM_TN_IMPL u_tn          (weight_tn.arch, weight_tn.tensor, suffix_u.c_str(),          weight_tn.bid, weight_tn.xid);
+        const std::string suffix_scale_pre = prefix + "_scale_pre";
+        const LLM_TN_IMPL scale_pre_tn  (weight_tn.arch, weight_tn.tensor, suffix_scale_pre.c_str(),  weight_tn.bid, weight_tn.xid);
+        const std::string suffix_scale_mid = prefix + "_scale_mid";
+        const LLM_TN_IMPL scale_mid_tn  (weight_tn.arch, weight_tn.tensor, suffix_scale_mid.c_str(),  weight_tn.bid, weight_tn.xid);
+        const std::string suffix_scale_post = prefix + "_scale_post";
+        const LLM_TN_IMPL scale_post_tn (weight_tn.arch, weight_tn.tensor, suffix_scale_post.c_str(), weight_tn.bid, weight_tn.xid);
+        const std::string suffix_salient_idx = prefix + "_salient_idx";
+        const LLM_TN_IMPL salient_idx_tn    (weight_tn.arch, weight_tn.tensor, suffix_salient_idx.c_str(),    weight_tn.bid, weight_tn.xid);
+        const std::string suffix_salient_weight = prefix + "_salient_weight";
+        const LLM_TN_IMPL salient_weight_tn (weight_tn.arch, weight_tn.tensor, suffix_salient_weight.c_str(), weight_tn.bid, weight_tn.xid);
+        const std::string suffix_salient_scale = prefix + "_salient_scale";
+        const LLM_TN_IMPL salient_scale_tn  (weight_tn.arch, weight_tn.tensor, suffix_salient_scale.c_str(),  weight_tn.bid, weight_tn.xid);
+    
+        // A complete NanoQuant tensor group replaces the dense .weight tensor while
+        // preserving the original tensor name as a virtual lookup key for graph code.
+        llama_nanoquant_weight nq;
+    
+        const auto * scale_mid_meta = ml->require_tensor_meta(scale_mid_tn.str());
+        const int64_t n_rank = scale_mid_meta->ne[0];
+        if (n_rank <= 0 || scale_mid_meta->ne[1] != 1) {
+            throw std::runtime_error("invalid NanoQuant component scale shape");
         }
-        if (salient_weight_meta->type == GGML_TYPE_I8) {
-            if (!has_salient_scale) {
-                throw std::runtime_error(format("%s: tensor '%s' uses I8 but '%s' is missing",
-                            __func__, salient_weight_tn.str().c_str(), salient_scale_tn.str().c_str()));
+    
+    
+        const int64_t n_words_in   = (n_in + 31)/32;
+        const int64_t n_words_rank = (n_rank + 31)/32;
+    
+        const auto * salient_idx_meta    = ml->get_tensor_meta(salient_idx_tn.str().c_str());
+        const auto * salient_weight_meta = ml->get_tensor_meta(salient_weight_tn.str().c_str());
+        const auto * salient_scale_meta  = ml->get_tensor_meta(salient_scale_tn.str().c_str());
+        const bool has_salient_idx    = salient_idx_meta != nullptr;
+        const bool has_salient_weight = salient_weight_meta != nullptr;
+        const bool has_salient_scale  = salient_scale_meta != nullptr;
+    
+        // Outlier weights form an optional side path, but idx and weight must still
+        // appear together so the op never has to infer a partial representation.
+        if (has_salient_idx != has_salient_weight) {
+            throw std::runtime_error(format("%s: NanoQuant tensor '%s' has an incomplete salient outlier group",
+                        __func__, weight_tn.str().c_str()));
+        }
+        if (has_salient_scale && !has_salient_weight) {
+            throw std::runtime_error(format("%s: NanoQuant tensor '%s' has a salient scale without salient weights",
+                        __func__, weight_tn.str().c_str()));
+        }
+    
+        const int sidecar_flags = flags & ~TENSOR_NOT_REQUIRED;
+    
+        nq.v          = create_tensor(*ml, v_tn,          { n_words_in,   n_rank }, sidecar_flags);
+        nq.u          = create_tensor(*ml, u_tn,          { n_words_rank, n_out  }, sidecar_flags);
+        nq.scale_pre  = create_tensor(*ml, scale_pre_tn,  { n_in   }, sidecar_flags);
+        nq.scale_mid  = create_tensor(*ml, scale_mid_tn,  { n_rank }, sidecar_flags);
+        nq.scale_post = create_tensor(*ml, scale_post_tn, { n_out  }, sidecar_flags);
+    
+        if (has_salient_idx) {
+            const int64_t n_salient = salient_idx_meta->ne[0];
+            if (salient_idx_meta->type != GGML_TYPE_I32) {
+                throw std::runtime_error(format("%s: tensor '%s' must be I32",
+                            __func__, salient_idx_tn.str().c_str()));
             }
-        } else if (salient_weight_meta->type != GGML_TYPE_F32 &&
-                   salient_weight_meta->type != GGML_TYPE_F16 &&
-                   salient_weight_meta->type != GGML_TYPE_BF16) {
-            throw std::runtime_error(format("%s: tensor '%s' has unsupported type %s",
-                        __func__, salient_weight_tn.str().c_str(), ggml_type_name(salient_weight_meta->type)));
+            if (salient_weight_meta->type == GGML_TYPE_I8) {
+                if (!has_salient_scale) {
+                    throw std::runtime_error(format("%s: tensor '%s' uses I8 but '%s' is missing",
+                                __func__, salient_weight_tn.str().c_str(), salient_scale_tn.str().c_str()));
+                }
+            } else if (salient_weight_meta->type != GGML_TYPE_F32 &&
+                       salient_weight_meta->type != GGML_TYPE_F16 &&
+                       salient_weight_meta->type != GGML_TYPE_BF16) {
+                throw std::runtime_error(format("%s: tensor '%s' has unsupported type %s",
+                            __func__, salient_weight_tn.str().c_str(), ggml_type_name(salient_weight_meta->type)));
+            }
+            if (has_salient_scale && salient_weight_meta->type != GGML_TYPE_I8) {
+                throw std::runtime_error(format("%s: tensor '%s' is only valid with an I8 salient weight",
+                            __func__, salient_scale_tn.str().c_str()));
+            }
+            if (has_salient_scale &&
+                salient_scale_meta->type != GGML_TYPE_F32 &&
+                salient_scale_meta->type != GGML_TYPE_F16 &&
+                salient_scale_meta->type != GGML_TYPE_BF16) {
+                throw std::runtime_error(format("%s: tensor '%s' has unsupported type %s",
+                            __func__, salient_scale_tn.str().c_str(), ggml_type_name(salient_scale_meta->type)));
+            }
+    
+            nq.salient_idx    = create_tensor(*ml, salient_idx_tn,    { n_salient },        sidecar_flags);
+            nq.salient_weight = create_tensor(*ml, salient_weight_tn, { n_salient, n_out }, sidecar_flags);
+            if (has_salient_scale) {
+                nq.salient_scale = create_tensor(*ml, salient_scale_tn, { n_salient }, sidecar_flags);
+            }
         }
-        if (has_salient_scale && salient_weight_meta->type != GGML_TYPE_I8) {
-            throw std::runtime_error(format("%s: tensor '%s' is only valid with an I8 salient weight",
-                        __func__, salient_scale_tn.str().c_str()));
+    
+        if (nq.v->type != GGML_TYPE_I32 || nq.u->type != GGML_TYPE_I32) {
+            throw std::runtime_error("NanoQuant packed factors must be I32");
         }
-        if (has_salient_scale &&
-            salient_scale_meta->type != GGML_TYPE_F32 &&
-            salient_scale_meta->type != GGML_TYPE_F16 &&
-            salient_scale_meta->type != GGML_TYPE_BF16) {
-            throw std::runtime_error(format("%s: tensor '%s' has unsupported type %s",
-                        __func__, salient_scale_tn.str().c_str(), ggml_type_name(salient_scale_meta->type)));
+        for (const auto * scale : {nq.scale_pre, nq.scale_mid, nq.scale_post}) {
+            if (scale->type != GGML_TYPE_BF16 && scale->type != GGML_TYPE_F16 && scale->type != GGML_TYPE_F32) {
+                throw std::runtime_error("NanoQuant scales must be floating point");
+            }
         }
-
-        nq.salient_idx    = create_tensor(*ml, salient_idx_tn,    { n_salient },        sidecar_flags);
-        nq.salient_weight = create_tensor(*ml, salient_weight_tn, { n_salient, n_out }, sidecar_flags);
-        if (has_salient_scale) {
-            nq.salient_scale = create_tensor(*ml, salient_scale_tn, { n_salient }, sidecar_flags);
+        return nq;
+    };
+    llama_nanoquant_weight nq = load_term(staged ? "nq_stage0" : "nq");
+    if (staged) {
+        uint32_t version = 0;
+        ml->get_key("quantization.nanoquant.version", version);
+        if (version != 3 || nq.salient_idx != nullptr) {
+            throw std::runtime_error("independent NanoQuant stages require version 3 without salient columns");
+        }
+        const std::string weight_name = weight_tn.str();
+        const std::string base = weight_name.substr(0, weight_name.size() - strlen(".weight"));
+        uint32_t count = 0;
+        ml->get_key("quantization.nanoquant." + base + ".residual_stage_count", count);
+        if (count == 0 || count > 65536) {
+            throw std::runtime_error("invalid independent NanoQuant stage count");
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            auto stage = load_term("nq_residual_" + std::to_string(i));
+            if (stage.salient_idx != nullptr) {
+                throw std::runtime_error("residual NanoQuant stages cannot carry salient columns");
+            }
+            nq.residual_stages.push_back(stage);
         }
     }
 

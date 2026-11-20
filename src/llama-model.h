@@ -222,6 +222,7 @@ struct llama_layer_nextn {
 };
 
 struct llama_nanoquant_weight {
+    std::vector<llama_nanoquant_weight> residual_stages;
     struct ggml_tensor * v          = nullptr;
     struct ggml_tensor * u          = nullptr;
     struct ggml_tensor * scale_pre  = nullptr;
